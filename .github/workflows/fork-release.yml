@@ -1,0 +1,145 @@
+name: fork-release
+
+# Lives on the default branch (fork-main). Rebases patch/main onto the newest upstream
+# release tag, builds an ad-hoc signed Release app, and publishes it as a release.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Upstream tag to build (default newest release)
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: supabitapp/supacode
+  PATCH_BRANCH: patch/main
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.d.outputs.tag }}
+    steps:
+      - id: d
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG="$INPUT_TAG"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release list -R "$UPSTREAM" --exclude-pre-releases --exclude-drafts -L 20 --json tagName \
+              --jq '[.[] | select(.tagName | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))][0].tagName')
+          fi
+          if gh release view "fork-$TAG" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "fork-$TAG already released"
+            TAG=""
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.tag != ''
+    runs-on: macos-26
+    timeout-minutes: 150
+    env:
+      TAG: ${{ needs.detect.outputs.tag }}
+      MISE_GITHUB_TOKEN: ${{ github.token }}
+      MISE_HTTP_TIMEOUT: 120
+      MISE_DISABLE_TOOLS: spm:swiftlang/swift-format,npm:create-dmg
+      CI: "1"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.PATCH_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT || github.token }}
+
+      - name: Rebase patch onto upstream tag
+        run: |
+          set -euo pipefail
+          git config user.name "fork-bot"
+          git config user.email "fork-bot@users.noreply.github.com"
+          git remote add upstream "https://github.com/$UPSTREAM.git"
+          git fetch upstream main --tags --force
+          BASE=$(git merge-base HEAD upstream/main)
+          git switch -c "release/$TAG"
+          git rebase --onto "refs/tags/$TAG" "$BASE" "release/$TAG"
+          git submodule update --init --recursive
+          git log --oneline -3
+
+      - name: Push release branch (needs GH_PAT with workflow scope)
+        continue-on-error: true
+        run: |
+          git push -f origin "release/$TAG"
+          git push -f origin "release/$TAG:$PATCH_BRANCH"
+
+      - name: Select a Zig-linkable Xcode
+        run: |
+          set -euo pipefail
+          sudo xcode-select -s "$(./scripts/select-developer-dir.sh)"
+          xcodebuild -version
+
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.3.0
+          cache: true
+
+      - name: Cache keys
+        run: |
+          set -euo pipefail
+          echo "XCODE_VERSION=$(xcodebuild -version | tr '\n' '-' | sed 's/[^A-Za-z0-9._-]/_/g; s/-$//')" >> "$GITHUB_ENV"
+          echo "GHOSTTY_SHA=$(git -C ThirdParty/ghostty rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "ZMX_SHA=$(git -C ThirdParty/zmx rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Ghostty cache
+        id: ghostty_cache
+        uses: actions/cache@v5
+        with:
+          path: .build/ghostty
+          key: ${{ runner.arch }}-xcode-${{ env.XCODE_VERSION }}-ghostty-${{ env.GHOSTTY_SHA }}-${{ hashFiles('scripts/build-ghostty.sh', 'mise.toml', '.gitmodules', 'patches/ghostty/*.patch') }}
+      - if: steps.ghostty_cache.outputs.cache-hit != 'true'
+        run: make build-ghostty-xcframework
+
+      - name: zmx cache
+        id: zmx_cache
+        uses: actions/cache@v5
+        with:
+          path: .build/zmx
+          key: ${{ runner.arch }}-xcode-${{ env.XCODE_VERSION }}-zmx-${{ env.ZMX_SHA }}-${{ hashFiles('scripts/build-zmx.sh', 'mise.toml', '.gitmodules', 'patches/zmx/*.patch') }}
+      - if: steps.zmx_cache.outputs.cache-hit != 'true'
+        run: make build-zmx
+
+      - name: Disable upstream Sparkle feed
+        run: /usr/libexec/PlistBuddy -c "Delete :SUFeedURL" supacode/Info.plist
+
+      - name: Archive (ad-hoc signed Release)
+        env:
+          APPLE_TEAM_ID: ""
+          DEVELOPER_ID_IDENTITY_SHA: "-"
+        run: make archive
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          APP=build/supacode.xcarchive/Products/Applications/supacode.app
+          codesign --force --deep --sign - "$APP"
+          codesign -dv "$APP" || true
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "build/supacode-${TAG}-fork.zip"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "fork-$TAG" "build/supacode-${TAG}-fork.zip" \
+            --target "${{ github.sha }}" \
+            --title "Fork build of $TAG" \
+            --notes "Upstream $TAG plus patch/main (license enforcement disabled). Ad-hoc signed; after download run: xattr -dr com.apple.quarantine supacode.app"
