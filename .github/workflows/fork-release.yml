@@ -140,6 +140,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "fork-$TAG" "build/supacode-${TAG}-fork.zip" \
+            -R "${{ github.repository }}" \
             --target "${{ github.sha }}" \
             --title "Fork build of $TAG" \
             --notes "Upstream $TAG plus patch/main (license enforcement disabled). Ad-hoc signed; after download run: xattr -dr com.apple.quarantine supacode.app"
