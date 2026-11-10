@@ -135,12 +135,24 @@ jobs:
           codesign -dv "$APP" || true
           ditto -c -k --sequesterRsrc --keepParent "$APP" "build/supacode-${TAG}-fork.zip"
 
+      # Kept so a publish failure does not lose a 1h+ build.
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: supacode-${{ env.TAG }}-fork
+          path: build/supacode-${{ env.TAG }}-fork.zip
+          retention-days: 14
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "fork-$TAG" "build/supacode-${TAG}-fork.zip" \
-            -R "${{ github.repository }}" \
-            --target "${{ github.sha }}" \
-            --title "Fork build of $TAG" \
-            --notes "Upstream $TAG plus patch/main (license enforcement disabled). Ad-hoc signed; after download run: xattr -dr com.apple.quarantine supacode.app"
+          create() {
+            gh release create "fork-$TAG" "build/supacode-${TAG}-fork.zip" \
+              -R "${{ github.repository }}" \
+              --target "$1" \
+              --title "Fork build of $TAG" \
+              --notes "Upstream $TAG plus patch/main (license enforcement disabled). Ad-hoc signed; after download run: xattr -dr com.apple.quarantine supacode.app"
+          }
+          # Tagging a commit that changes workflow files can be refused for GITHUB_TOKEN; main's commits do not.
+          create "${{ github.sha }}" || create main
