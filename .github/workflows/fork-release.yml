@@ -4,7 +4,7 @@ name: fork-release
 # release tag, builds an ad-hoc signed Release app, and publishes it as a release.
 on:
   schedule:
-    - cron: "17 6 * * *"
+    - cron: "17 8 * * *"
   workflow_dispatch:
     inputs:
       tag:
